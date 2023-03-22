@@ -1,0 +1,16 @@
+[
+  {
+    "arguments": [
+      "/sbin/cc",
+      "-c",
+      "-g",
+      "-O0",
+      "-o",
+      "main",
+      "main.c"
+    ],
+    "directory": "/home/shura/l/pam-example",
+    "file": "/home/shura/l/pam-example/main.c",
+    "output": "/home/shura/l/pam-example/main"
+  }
+]
