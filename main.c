@@ -10,14 +10,7 @@
 #include <time.h>
 #include <unistd.h>
 
-#ifdef __linux
-#include <sys/epoll.h>
-#include <sys/timerfd.h>
-#elif __APPLE__
 #include <sys/select.h>
-#else
-#error "unsupported platform"
-#endif
 
 struct Buffer {
   size_t len;
@@ -66,128 +59,6 @@ static void buffer_destroy(struct Buffer *buf) {
   buf->len = buf->cap = 0;
 }
 
-#ifdef __linux
-char *readline(FILE *fp, time_t timeout) {
-  char *res = NULL;
-  int tfd = -1;
-  int efd = -1;
-  struct Buffer buf = buffer_new();
-
-  int flags = 0;
-  {
-    int f = fcntl(fileno(fp), F_GETFL);
-    if (f < 0) {
-      return res;
-    }
-    if (!(f & O_NONBLOCK)) {
-      if (fcntl(fileno(fp), F_SETFL, f | O_NONBLOCK) < 0) {
-        goto err;
-      }
-      flags = f;
-    }
-  }
-
-  if ((tfd = timerfd_create(CLOCK_BOOTTIME, TFD_NONBLOCK | TFD_CLOEXEC)) < 0) {
-    goto err;
-  }
-
-  {
-    struct itimerspec spec = {{0, 0}, {timeout, 0}};
-    if (timerfd_settime(tfd, 0, &spec, NULL) < 0) {
-      goto err;
-    }
-  }
-
-  if ((efd = epoll_create1(EPOLL_CLOEXEC)) < 0) {
-    goto err;
-  }
-
-  {
-    struct epoll_event ev = {EPOLLIN, {.fd = tfd}};
-    if (epoll_ctl(efd, EPOLL_CTL_ADD, tfd, &ev) < 0) {
-      goto err;
-    }
-  }
-
-  {
-    struct epoll_event ev = {EPOLLIN, {.fd = fileno(fp)}};
-    if (epoll_ctl(efd, EPOLL_CTL_ADD, fileno(fp), &ev) < 0) {
-      goto err;
-    }
-  }
-
-  for (;;) {
-    struct epoll_event ev;
-    int err;
-    while ((err = epoll_wait(efd, &ev, 1, -1)) < 0 && errno == EINTR)
-      ;
-
-    if (ev.data.fd == tfd) {
-      putchar('\n');
-      errno = ETIMEDOUT;
-      goto err;
-    } else if (ev.data.fd == fileno(fp)) {
-      bool cont;
-      do {
-        int ch;
-        cont = false;
-        while ((ch = fgetc(fp)) < 0 && ch != EOF && errno == EINTR)
-          ;
-
-        if (ch < 0) {
-          if (ch == EOF) {
-            putchar('\n');
-            res = buffer_to_string(&buf);
-            goto end;
-          } else if (errno != EAGAIN) {
-            goto err;
-          }
-        } else {
-          char c = ch;
-
-          if (c == '\n') {
-            if (buf.data[buf.len - 1] == '\r') {
-              --buf.len;
-            }
-            res = buffer_to_string(&buf);
-            goto end;
-          } else if (c == '\x15') {
-            memset(buf.data, 0, buf.len);
-            buf.len = 0;
-            cont = true;
-          } else {
-            buffer_push_char(&buf, c);
-            cont = true;
-          }
-        }
-      } while (cont);
-    }
-  }
-
-  goto end;
-err:
-end : {
-  int backup_errno = errno;
-
-  if (flags) {
-    fcntl(fileno(fp), flags);
-  }
-
-  if (tfd >= 0) {
-    close(tfd);
-  }
-
-  if (efd >= 0) {
-    close(efd);
-  }
-
-  buffer_destroy(&buf);
-
-  errno = backup_errno;
-}
-  return res;
-}
-#elif __APPLE__
 char *readline(FILE *fp, time_t timeout) {
   char *res = NULL;
   struct Buffer buf = buffer_new();
@@ -279,7 +150,6 @@ end : {
 }
   return res;
 }
-#endif
 
 char *readline_noecho(FILE *fp, time_t timeout) {
   char *res = NULL;
