@@ -1,17 +1,23 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <pwd.h>
-#include <security/_pam_types.h>
 #include <security/pam_appl.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/epoll.h>
-#include <sys/timerfd.h>
 #include <termios.h>
 #include <time.h>
 #include <unistd.h>
+
+#ifdef __linux
+#include <sys/epoll.h>
+#include <sys/timerfd.h>
+#elif __APPLE__
+#include <sys/select.h>
+#else
+#error "unsupported platform"
+#endif
 
 struct Buffer {
   size_t len;
@@ -60,6 +66,7 @@ static void buffer_destroy(struct Buffer *buf) {
   buf->len = buf->cap = 0;
 }
 
+#ifdef __linux
 char *readline(FILE *fp, time_t timeout) {
   char *res = NULL;
   int tfd = -1;
@@ -69,9 +76,14 @@ char *readline(FILE *fp, time_t timeout) {
   int flags = 0;
   {
     int f = fcntl(fileno(fp), F_GETFL);
+    if (f < 0) {
+      return res;
+    }
     if (!(f & O_NONBLOCK)) {
+      if (fcntl(fileno(fp), F_SETFL, f | O_NONBLOCK) < 0) {
+        goto err;
+      }
       flags = f;
-      fcntl(fileno(fp), F_SETFL, f | O_NONBLOCK);
     }
   }
 
@@ -157,7 +169,9 @@ err:
 end : {
   int backup_errno = errno;
 
-  fcntl(fileno(fp), flags);
+  if (flags) {
+    fcntl(fileno(fp), flags);
+  }
 
   if (tfd >= 0) {
     close(tfd);
@@ -173,6 +187,99 @@ end : {
 }
   return res;
 }
+#elif __APPLE__
+char *readline(FILE *fp, time_t timeout) {
+  char *res = NULL;
+  struct Buffer buf = buffer_new();
+
+  int flags = 0;
+  {
+    int f = fcntl(fileno(fp), F_GETFL);
+    if (f == -1) {
+      return res;
+    }
+    if (!(f & O_NONBLOCK)) {
+      if (fcntl(fileno(fp), F_SETFL, f | O_NONBLOCK) == -1) {
+        goto err;
+      }
+      flags = f;
+    }
+  }
+
+  fd_set fds;
+  FD_ZERO(&fds);
+  for (;;) {
+    struct timeval timeout_val = {timeout, 0};
+    FD_SET(fileno(fp), &fds);
+
+    {
+      int err;
+      while ((err = select(fileno(fp) + 1, &fds, NULL, NULL, &timeout_val)) ==
+                 -1 &&
+             errno == EINTR)
+        ;
+      if (err == 0) {
+        errno = ETIMEDOUT;
+        goto err;
+      } else if (err == -1) {
+        goto err;
+      }
+    }
+
+    bool cont;
+    do {
+      int ch;
+      cont = false;
+      while ((ch = fgetc(fp)) == -1 && ferror(fp) && errno == EINTR)
+        ;
+
+      if (ch == -1) {
+        if (ferror(fp)) {
+          if (errno != EAGAIN) {
+            goto err;
+          }
+        } else {
+          putchar('\n');
+          res = buffer_to_string(&buf);
+          goto end;
+        }
+      } else {
+        char c = ch;
+
+        if (c == '\n') {
+          if (buf.data[buf.len - 1] == '\r') {
+            --buf.len;
+          }
+          res = buffer_to_string(&buf);
+          goto end;
+        } else if (c == '\x15') {
+          memset(buf.data, 0, buf.len);
+          buf.len = 0;
+          cont = true;
+        } else {
+          buffer_push_char(&buf, c);
+          cont = true;
+        }
+      }
+    } while (cont);
+  }
+
+  goto end;
+err:
+end : {
+  int backup_errno = errno;
+
+  if (flags) {
+    fcntl(fileno(fp), flags);
+  }
+
+  buffer_destroy(&buf);
+
+  errno = backup_errno;
+}
+  return res;
+}
+#endif
 
 char *readline_noecho(FILE *fp, time_t timeout) {
   char *res = NULL;
@@ -222,6 +329,7 @@ int conversation(int num_msgs, const struct pam_message **msgs,
         res->resp = line;
         res->resp_retcode = PAM_SUCCESS;
       } else {
+        putchar('\n');
         res->resp = NULL;
         res->resp_retcode = PAM_CONV_ERR;
       }
@@ -235,6 +343,7 @@ int conversation(int num_msgs, const struct pam_message **msgs,
         res->resp = line;
         res->resp_retcode = PAM_SUCCESS;
       } else {
+        putchar('\n');
         res->resp = NULL;
         res->resp_retcode = PAM_CONV_ERR;
       }
@@ -279,6 +388,8 @@ int main(void) {
 
     username = strdup(pw->pw_name);
   }
+
+  printf("Hi, %s!\n", username);
 
   struct pam_conv conv = {conversation, NULL};
 
